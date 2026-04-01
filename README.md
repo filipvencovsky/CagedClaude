@@ -48,7 +48,7 @@ The result:
 ## Installation
 
 ```bash
-git clone https://github.com/you/caged-claude.git
+git clone https://github.com/filipvencovsky/CagedClaude.git
 cd caged-claude
 bash install.sh
 ```
