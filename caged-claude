@@ -1,0 +1,137 @@
+#!/bin/bash
+# caged-claude – run Claude Code in an isolated Docker container
+#
+# Usage:
+#   caged-claude                run Claude Code in the current directory
+#   caged-claude clean-cage     remove all per-project .claude volumes
+#   caged-claude update-claude  force rebuild of the Docker image
+#   caged-claude help           show wrapper help followed by claude help
+#   caged-claude [args...]      pass any other arguments directly to claude
+
+set -e
+
+# ── configuration ────────────────────────────────────────────────────────────
+
+IMAGE_NAME="caged-claude"
+BUILD_PATH_FILE="$HOME/.local/share/caged-claude/docker-path"
+UPDATE_MARKER="$HOME/.local/share/caged-claude/last-update"
+UPDATE_INTERVAL_DAYS=7
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+require_build_path() {
+    [[ -f "$BUILD_PATH_FILE" ]] \
+        || die "caged-claude is not installed. Run install.sh first."
+    DOCKER_BUILD_PATH=$(cat "$BUILD_PATH_FILE")
+    [[ -d "$DOCKER_BUILD_PATH" ]] \
+        || die "Build path '$DOCKER_BUILD_PATH' no longer exists. Re-run install.sh."
+}
+
+do_build() {
+    echo "Building $IMAGE_NAME image..."
+    docker build --no-cache -t "$IMAGE_NAME" "$DOCKER_BUILD_PATH"
+    touch "$UPDATE_MARKER"
+    echo "Build complete."
+}
+
+check_for_update() {
+    require_build_path
+    local needs_update=true
+    if [[ -f "$UPDATE_MARKER" ]]; then
+        # -mtime +N means "older than N*24 hours"
+        if [[ -z $(find "$UPDATE_MARKER" -mtime +"$UPDATE_INTERVAL_DAYS" 2>/dev/null) ]]; then
+            needs_update=false
+        fi
+    fi
+    if $needs_update; then
+        echo "Image is older than $UPDATE_INTERVAL_DAYS days – rebuilding..."
+        do_build
+    fi
+}
+
+# ── subcommands ───────────────────────────────────────────────────────────────
+
+cmd_help() {
+    cat <<EOF
+Usage: caged-claude [command|args...]
+
+Wrapper commands (handled before Claude starts):
+  clean-cage     Remove all per-project .claude Docker volumes
+  update-claude  Force a rebuild of the Docker image regardless of age
+  help           Show this help, then show claude's own help
+
+All other arguments are passed directly to claude inside the container, e.g.:
+  caged-claude                     interactive session
+  caged-claude "fix the tests"     pass a prompt directly
+  caged-claude config              run claude config
+
+Each directory gets its own isolated Docker volume for Claude's state
+(.claude/), so projects never share history or context.
+
+Configuration:
+  Update interval : $UPDATE_INTERVAL_DAYS days  (edit UPDATE_INTERVAL_DAYS in this script)
+  Docker image    : $IMAGE_NAME
+  Auth            : managed by Claude Code (run 'caged-claude' and log in)
+
+────────────────────────────────────────────────────────────────
+EOF
+    # Show claude's own help below the wrapper help
+    docker run --rm "$IMAGE_NAME" --help 2>/dev/null || true
+}
+
+cmd_update_claude() {
+    require_build_path
+    do_build
+}
+
+cmd_clean_cage() {
+    echo "The following caged-claude volumes will be removed:"
+    local volumes
+    volumes=$(docker volume ls --format '{{.Name}}' | grep '^caged-claude-' || true)
+    if [[ -z "$volumes" ]]; then
+        echo "  (none found)"
+        return
+    fi
+    echo "$volumes" | sed 's/^/  /'
+    echo ""
+    read -r -p "Proceed? [y/N] " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        echo "$volumes" | xargs docker volume rm
+        echo "Done."
+    else
+        echo "Aborted."
+    fi
+}
+
+cmd_run() {
+    check_for_update
+
+    local host_path
+    host_path=$(pwd)
+
+    # Derive a volume name from a hash of the absolute path to avoid collisions.
+    # A human-readable suffix (basename) is appended for convenience.
+    local path_hash base_name volume_name
+    path_hash=$(echo -n "$host_path" | sha256sum | cut -c1-12)
+    base_name=$(basename "$host_path" | tr -cd 'a-zA-Z0-9_-')
+    volume_name="caged-claude-${base_name}-${path_hash}"
+
+    docker run -it --rm \
+        -v "$host_path":/workspace \
+        -v "$volume_name":/home/claude/.claude \
+        -e HOST_UID="$(id -u)" \
+        -e HOST_GID="$(id -g)" \
+        -e CLAUDE_WORKSPACE="$host_path" \
+        "$IMAGE_NAME" "$@"
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    clean-cage)    cmd_clean_cage ;;
+    update-claude) cmd_update_claude ;;
+    help|--help)   cmd_help ;;
+    *)             cmd_run "$@" ;;
+esac
